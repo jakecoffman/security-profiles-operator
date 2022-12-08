@@ -22,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 )
@@ -57,6 +58,13 @@ type LocalConnectionSecretWriterTo interface {
 type ConnectionSecretWriterTo interface {
 	SetWriteConnectionSecretToReference(r *xpv1.SecretReference)
 	GetWriteConnectionSecretToReference() *xpv1.SecretReference
+}
+
+// A ConnectionDetailsPublisherTo may write a connection details secret to a
+// secret store
+type ConnectionDetailsPublisherTo interface {
+	SetPublishConnectionDetailsTo(r *xpv1.PublishConnectionDetailsTo)
+	GetPublishConnectionDetailsTo() *xpv1.PublishConnectionDetailsTo
 }
 
 // An Orphanable resource may specify a DeletionPolicy.
@@ -108,6 +116,20 @@ type CompositionReferencer interface {
 	GetCompositionReference() *corev1.ObjectReference
 }
 
+// A CompositionRevisionReferencer may reference a specific revision of a
+// composition of resources.
+type CompositionRevisionReferencer interface {
+	SetCompositionRevisionReference(*corev1.ObjectReference)
+	GetCompositionRevisionReference() *corev1.ObjectReference
+}
+
+// A CompositionUpdater uses a composition, and may update which revision of
+// that composition it uses.
+type CompositionUpdater interface {
+	SetCompositionUpdatePolicy(*xpv1.UpdatePolicy)
+	GetCompositionUpdatePolicy() *xpv1.UpdatePolicy
+}
+
 // A ComposedResourcesReferencer may reference the resources it composes.
 type ComposedResourcesReferencer interface {
 	SetResourceReferences([]corev1.ObjectReference)
@@ -118,6 +140,12 @@ type ComposedResourcesReferencer interface {
 type CompositeResourceReferencer interface {
 	SetResourceReference(r *corev1.ObjectReference)
 	GetResourceReference() *corev1.ObjectReference
+}
+
+// An EnvironmentConfigReferencer references a list of EnvironmentConfigs.
+type EnvironmentConfigReferencer interface {
+	SetEnvironmentConfigReferences([]corev1.ObjectReference)
+	GetEnvironmentConfigReferences() []corev1.ObjectReference
 }
 
 // A UserCounter can count how many users it has.
@@ -147,6 +175,7 @@ type Managed interface {
 	ProviderReferencer
 	ProviderConfigReferencer
 	ConnectionSecretWriterTo
+	ConnectionDetailsPublisherTo
 	Orphanable
 
 	Conditioned
@@ -154,7 +183,7 @@ type Managed interface {
 
 // A ManagedList is a list of managed resources.
 type ManagedList interface {
-	runtime.Object
+	client.ObjectList
 
 	// GetItems returns the list of managed resources.
 	GetItems() []Managed
@@ -178,7 +207,7 @@ type ProviderConfigUsage interface {
 
 // A ProviderConfigUsageList is a list of provider config usages.
 type ProviderConfigUsageList interface {
-	runtime.Object
+	client.ObjectList
 
 	// GetItems returns the list of provider config usages.
 	GetItems() []ProviderConfigUsage
@@ -190,9 +219,13 @@ type Composite interface {
 
 	CompositionSelector
 	CompositionReferencer
+	CompositionUpdater
+	CompositionRevisionReferencer
 	ComposedResourcesReferencer
+	EnvironmentConfigReferencer
 	ClaimReferencer
 	ConnectionSecretWriterTo
+	ConnectionDetailsPublisherTo
 
 	Conditioned
 	ConnectionDetailsPublishedTimer
@@ -204,6 +237,7 @@ type Composed interface {
 
 	Conditioned
 	ConnectionSecretWriterTo
+	ConnectionDetailsPublisherTo
 }
 
 // A CompositeClaim for a Composite resource.
@@ -212,8 +246,11 @@ type CompositeClaim interface {
 
 	CompositionSelector
 	CompositionReferencer
+	CompositionUpdater
+	CompositionRevisionReferencer
 	CompositeResourceReferencer
 	LocalConnectionSecretWriterTo
+	ConnectionDetailsPublisherTo
 
 	Conditioned
 	ConnectionDetailsPublishedTimer

@@ -20,16 +20,18 @@ import (
 	"context"
 	"strings"
 
-	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
+	"github.com/crossplane/crossplane-runtime/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
 )
 
@@ -61,6 +63,14 @@ type ProviderConfigKinds struct {
 	UsageList schema.GroupVersionKind
 }
 
+// A ConnectionSecretOwner is a Kubernetes object that owns a connection secret.
+type ConnectionSecretOwner interface {
+	Object
+
+	ConnectionSecretWriterTo
+	ConnectionDetailsPublisherTo
+}
+
 // A LocalConnectionSecretOwner may create and manage a connection secret in its
 // own namespace.
 type LocalConnectionSecretOwner interface {
@@ -68,6 +78,7 @@ type LocalConnectionSecretOwner interface {
 	metav1.Object
 
 	LocalConnectionSecretWriterTo
+	ConnectionDetailsPublisherTo
 }
 
 // A ConnectionPropagator is responsible for propagating information required to
@@ -111,15 +122,6 @@ func LocalConnectionSecretFor(o LocalConnectionSecretOwner, kind schema.GroupVer
 		Type: SecretTypeConnection,
 		Data: make(map[string][]byte),
 	}
-}
-
-// A ConnectionSecretOwner may create and manage a connection secret in an
-// arbitrary namespace.
-type ConnectionSecretOwner interface {
-	runtime.Object
-	metav1.Object
-
-	ConnectionSecretWriterTo
 }
 
 // ConnectionSecretFor creates a connection for the supplied
@@ -180,10 +182,22 @@ func MustGetKind(obj runtime.Object, ot runtime.ObjectTyper) schema.GroupVersion
 type ErrorIs func(err error) bool
 
 // Ignore any errors that satisfy the supplied ErrorIs function by returning
-// nil. Errors that do not satisfy the suppled function are returned unmodified.
+// nil. Errors that do not satisfy the supplied function are returned unmodified.
 func Ignore(is ErrorIs, err error) error {
 	if is(err) {
 		return nil
+	}
+	return err
+}
+
+// IgnoreAny ignores errors that satisfy any of the supplied ErrorIs functions
+// by returning nil. Errors that do not satisfy any of the supplied functions
+// are returned unmodified.
+func IgnoreAny(err error, is ...ErrorIs) error {
+	for _, f := range is {
+		if f(err) {
+			return nil
+		}
 	}
 	return err
 }
@@ -196,8 +210,13 @@ func IgnoreNotFound(err error) error {
 
 // IsAPIError returns true if the given error's type is of Kubernetes API error.
 func IsAPIError(err error) bool {
-	_, ok := err.(kerrors.APIStatus)
+	_, ok := err.(kerrors.APIStatus) //nolint: errorlint // we assert against the kerrors.APIStatus Interface which does not implement the error interface
 	return ok
+}
+
+// IsAPIErrorWrapped returns true if err is a K8s API error, or recursively wraps a K8s API error
+func IsAPIErrorWrapped(err error) bool {
+	return IsAPIError(errors.Cause(err))
 }
 
 // IsConditionTrue returns if condition status is true
@@ -207,7 +226,40 @@ func IsConditionTrue(c xpv1.Condition) bool {
 
 // An Applicator applies changes to an object.
 type Applicator interface {
-	Apply(context.Context, runtime.Object, ...ApplyOption) error
+	Apply(context.Context, client.Object, ...ApplyOption) error
+}
+
+type shouldRetryFunc func(error) bool
+
+// An ApplicatorWithRetry applies changes to an object, retrying on transient failures
+type ApplicatorWithRetry struct {
+	Applicator
+	shouldRetry shouldRetryFunc
+	backoff     wait.Backoff
+}
+
+// Apply invokes nested Applicator's Apply retrying on designated errors
+func (awr *ApplicatorWithRetry) Apply(ctx context.Context, c client.Object, opts ...ApplyOption) error {
+	return retry.OnError(awr.backoff, awr.shouldRetry, func() error {
+		return awr.Applicator.Apply(ctx, c, opts...)
+	})
+}
+
+// NewApplicatorWithRetry returns an ApplicatorWithRetry for the specified
+// applicator and with the specified retry function.
+//   If backoff is nil, then retry.DefaultRetry is used as the default.
+func NewApplicatorWithRetry(applicator Applicator, shouldRetry shouldRetryFunc, backoff *wait.Backoff) *ApplicatorWithRetry {
+	result := &ApplicatorWithRetry{
+		Applicator:  applicator,
+		shouldRetry: shouldRetry,
+		backoff:     retry.DefaultRetry,
+	}
+
+	if backoff != nil {
+		result.backoff = *backoff
+	}
+
+	return result
 }
 
 // A ClientApplicator may be used to build a single 'client' that satisfies both
@@ -218,10 +270,10 @@ type ClientApplicator struct {
 }
 
 // An ApplyFn is a function that satisfies the Applicator interface.
-type ApplyFn func(context.Context, runtime.Object, ...ApplyOption) error
+type ApplyFn func(context.Context, client.Object, ...ApplyOption) error
 
 // Apply changes to the supplied object.
-func (fn ApplyFn) Apply(ctx context.Context, o runtime.Object, ao ...ApplyOption) error {
+func (fn ApplyFn) Apply(ctx context.Context, o client.Object, ao ...ApplyOption) error {
 	return fn(ctx, o, ao...)
 }
 
@@ -248,7 +300,7 @@ func (e errNotControllable) NotControllable() bool {
 // resource is not controllable - i.e. that it another resource is not and may
 // not become its controller reference.
 func IsNotControllable(err error) bool {
-	_, ok := err.(interface {
+	_, ok := err.(interface { //nolint: errorlint // Skip errorlint for interface type
 		NotControllable() bool
 	})
 	return ok
@@ -310,10 +362,15 @@ func (e errNotAllowed) NotAllowed() bool {
 	return true
 }
 
+// NewNotAllowed returns a new NotAllowed error
+func NewNotAllowed(message string) error {
+	return errNotAllowed{error: errors.New(message)}
+}
+
 // IsNotAllowed returns true if the supplied error indicates that an operation
 // was not allowed.
 func IsNotAllowed(err error) bool {
-	_, ok := err.(interface {
+	_, ok := err.(interface { //nolint: errorlint // Skip errorlint for interface type
 		NotAllowed() bool
 	})
 	return ok
@@ -336,7 +393,7 @@ func AllowUpdateIf(fn func(current, desired runtime.Object) bool) ApplyOption {
 // not exist, or patched if it does.
 //
 // Deprecated: use APIPatchingApplicator instead.
-func Apply(ctx context.Context, c client.Client, o runtime.Object, ao ...ApplyOption) error {
+func Apply(ctx context.Context, c client.Client, o client.Object, ao ...ApplyOption) error {
 	return NewAPIPatchingApplicator(c).Apply(ctx, o, ao...)
 }
 
