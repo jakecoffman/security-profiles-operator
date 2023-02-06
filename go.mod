@@ -6,8 +6,8 @@ require (
 	github.com/cirocosta/dmesg_exporter v0.0.0-20190515130104-6e3e42fc8d7b
 	github.com/containers/common v0.35.1
 	github.com/crossplane/crossplane-runtime v0.12.0
-	github.com/go-logr/logr v0.4.0
-	github.com/maxbrunsfeld/counterfeiter/v6 v6.3.0
+	github.com/go-logr/logr v1.2.3
+	github.com/maxbrunsfeld/counterfeiter/v6 v6.6.1
 	github.com/pkg/errors v0.9.1
 	github.com/stretchr/testify v1.7.0
 	github.com/urfave/cli/v2 v2.3.0
