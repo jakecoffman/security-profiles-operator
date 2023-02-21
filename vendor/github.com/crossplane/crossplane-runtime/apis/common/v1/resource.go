@@ -77,10 +77,50 @@ type SecretKeySelector struct {
 	Key string `json:"key"`
 }
 
+// Policy represents the Resolve and Resolution policies of Reference instance.
+type Policy struct {
+	// Resolve specifies when this reference should be resolved. The default
+	// is 'IfNotPresent', which will attempt to resolve the reference only when
+	// the corresponding field is not present. Use 'Always' to resolve the
+	// reference on every reconcile.
+	// +optional
+	// +kubebuilder:validation:Enum=Always;IfNotPresent
+	Resolve *ResolvePolicy `json:"resolve,omitempty"`
+
+	// Resolution specifies whether resolution of this reference is required.
+	// The default is 'Required', which means the reconcile will fail if the
+	// reference cannot be resolved. 'Optional' means this reference will be
+	// a no-op if it cannot be resolved.
+	// +optional
+	// +kubebuilder:default=Required
+	// +kubebuilder:validation:Enum=Required;Optional
+	Resolution *ResolutionPolicy `json:"resolution,omitempty"`
+}
+
+// IsResolutionPolicyOptional checks whether the resolution policy of relevant reference is Optional.
+func (p *Policy) IsResolutionPolicyOptional() bool {
+	if p == nil || p.Resolution == nil {
+		return false
+	}
+	return *p.Resolution == ResolutionPolicyOptional
+}
+
+// IsResolvePolicyAlways checks whether the resolution policy of relevant reference is Always.
+func (p *Policy) IsResolvePolicyAlways() bool {
+	if p == nil || p.Resolve == nil {
+		return false
+	}
+	return *p.Resolve == ResolvePolicyAlways
+}
+
 // A Reference to a named object.
 type Reference struct {
 	// Name of the referenced object.
 	Name string `json:"name"`
+
+	// Policies for referencing.
+	// +optional
+	Policy *Policy `json:"policy,omitempty"`
 }
 
 // A TypedReference refers to an object by Name, Kind, and APIVersion. It is
@@ -109,6 +149,10 @@ type Selector struct {
 	// MatchControllerRef ensures an object with the same controller reference
 	// as the selecting object is selected.
 	MatchControllerRef *bool `json:"matchControllerRef,omitempty"`
+
+	// Policies for selection.
+	// +optional
+	Policy *Policy `json:"policy,omitempty"`
 }
 
 // SetGroupVersionKind sets the Kind and APIVersion of a TypedReference.
@@ -133,12 +177,25 @@ type ResourceSpec struct {
 	// Secret to which any connection details for this managed resource should
 	// be written. Connection details frequently include the endpoint, username,
 	// and password required to connect to the managed resource.
+	// This field is planned to be replaced in a future release in favor of
+	// PublishConnectionDetailsTo. Currently, both could be set independently
+	// and connection details would be published to both without affecting
+	// each other.
 	// +optional
 	WriteConnectionSecretToReference *SecretReference `json:"writeConnectionSecretToRef,omitempty"`
+
+	// PublishConnectionDetailsTo specifies the connection secret config which
+	// contains a name, metadata and a reference to secret store config to
+	// which any connection details for this managed resource should be written.
+	// Connection details frequently include the endpoint, username,
+	// and password required to connect to the managed resource.
+	// +optional
+	PublishConnectionDetailsTo *PublishConnectionDetailsTo `json:"publishConnectionDetailsTo,omitempty"`
 
 	// ProviderConfigReference specifies how the provider that will be used to
 	// create, observe, update, and delete this managed resource should be
 	// configured.
+	// +kubebuilder:default={"name": "default"}
 	ProviderConfigReference *Reference `json:"providerConfigRef,omitempty"`
 
 	// ProviderReference specifies the provider that will be used to create,
@@ -148,36 +205,15 @@ type ResourceSpec struct {
 
 	// DeletionPolicy specifies what will happen to the underlying external
 	// when this managed resource is deleted - either "Delete" or "Orphan" the
-	// external resource. The "Delete" policy is the default when no policy is
-	// specified.
-	//
+	// external resource.
 	// +optional
-	// +kubebuilder:validation:Enum=Orphan;Delete
+	// +kubebuilder:default=Delete
 	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
 // ResourceStatus represents the observed state of a managed resource.
 type ResourceStatus struct {
 	ConditionedStatus `json:",inline"`
-}
-
-// A ProviderSpec defines the common way to get to the necessary objects to
-// connect to the provider.
-// Deprecated: Please use ProviderConfigSpec.
-type ProviderSpec struct {
-	// CredentialsSecretRef references a specific secret's key that contains
-	// the credentials that are used to connect to the provider.
-	// +optional
-	CredentialsSecretRef *SecretKeySelector `json:"credentialsSecretRef,omitempty"`
-}
-
-// A ProviderConfigSpec defines the desired state of a provider config. A
-// provider config may embed this type in its spec in order to support standard
-// fields. Provider configs may choose to avoid embedding this type as
-// appropriate, but are encouraged to follow its conventions.
-type ProviderConfigSpec struct {
-	// Credentials required to authenticate to this provider.
-	Credentials ProviderCredentials `json:"credentials"`
 }
 
 // A CredentialsSource is a source from which provider credentials may be
@@ -198,18 +234,45 @@ const (
 	// Workload Identity for GCP, Pod Identity for Azure, or in-cluster
 	// authentication for the Kubernetes API.
 	CredentialsSourceInjectedIdentity CredentialsSource = "InjectedIdentity"
+
+	// CredentialsSourceEnvironment indicates that a provider should acquire
+	// credentials from an environment variable.
+	CredentialsSourceEnvironment CredentialsSource = "Environment"
+
+	// CredentialsSourceFilesystem indicates that a provider should acquire
+	// credentials from the filesystem.
+	CredentialsSourceFilesystem CredentialsSource = "Filesystem"
 )
 
-// ProviderCredentials required to authenticate.
-type ProviderCredentials struct {
-	// Source of the provider credentials.
-	// +kubebuilder:validation:Enum=None;Secret;InjectedIdentity
-	Source CredentialsSource `json:"source"`
+// CommonCredentialSelectors provides common selectors for extracting
+// credentials.
+type CommonCredentialSelectors struct {
+	// Fs is a reference to a filesystem location that contains credentials that
+	// must be used to connect to the provider.
+	// +optional
+	Fs *FsSelector `json:"fs,omitempty"`
 
-	// A CredentialsSecretRef is a reference to a secret key that contains the
-	// credentials that must be used to connect to the provider.
+	// Env is a reference to an environment variable that contains credentials
+	// that must be used to connect to the provider.
+	// +optional
+	Env *EnvSelector `json:"env,omitempty"`
+
+	// A SecretRef is a reference to a secret key that contains the credentials
+	// that must be used to connect to the provider.
 	// +optional
 	SecretRef *SecretKeySelector `json:"secretRef,omitempty"`
+}
+
+// EnvSelector selects an environment variable.
+type EnvSelector struct {
+	// Name is the name of an environment variable.
+	Name string `json:"name"`
+}
+
+// FsSelector selects a filesystem location.
+type FsSelector struct {
+	// Path is a filesystem path.
+	Path string `json:"path"`
 }
 
 // A ProviderConfigStatus defines the observed status of a ProviderConfig.
@@ -232,6 +295,8 @@ type ProviderConfigUsage struct {
 
 // A TargetSpec defines the common fields of objects used for exposing
 // infrastructure to workloads that can be scheduled to.
+//
+// Deprecated.
 type TargetSpec struct {
 	// WriteConnectionSecretToReference specifies the name of a Secret, in the
 	// same namespace as this target, to which any connection details for this
@@ -249,6 +314,8 @@ type TargetSpec struct {
 }
 
 // A TargetStatus defines the observed status a target.
+//
+// Deprecated.
 type TargetStatus struct {
 	ConditionedStatus `json:",inline"`
 }
